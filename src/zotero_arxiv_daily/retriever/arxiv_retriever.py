@@ -129,7 +129,39 @@ class ArxivRetriever(BaseRetriever):
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
+            if all_paper_ids:
+                all_paper_ids = all_paper_ids[:5]
+                logger.info(f"Debug mode: using {len(all_paper_ids)} papers from RSS.")
+            else:
+                logger.warning(
+                    "Debug mode enabled, but RSS returned no papers. "
+                    "Falling back to the 5 most recent arXiv papers."
+                )
+        
+                fallback_query = " OR ".join(
+                    f"cat:{category}"
+                    for category in self.config.source.arxiv.category
+                )
+        
+                fallback_search = arxiv.Search(
+                    query=fallback_query,
+                    max_results=5,
+                    sort_by=arxiv.SortCriterion.SubmittedDate,
+                    sort_order=arxiv.SortOrder.Descending,
+                )
+        
+                try:
+                    fallback_results = list(client.results(fallback_search))
+                    all_paper_ids = [
+                        result.get_short_id().split("v")[0]
+                        for result in fallback_results
+                    ]
+                    logger.info(
+                        f"Debug fallback retrieved {len(all_paper_ids)} recent arXiv papers."
+                    )
+                except Exception as exc:
+                    logger.error(f"Debug fallback failed: {exc}")
+                    all_paper_ids = []
 
         # Get full information of each paper from arxiv api
         bar = tqdm(total=len(all_paper_ids))
