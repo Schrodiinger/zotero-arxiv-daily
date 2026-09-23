@@ -113,6 +113,9 @@ class Executor:
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):
+                enricher = getattr(self.retrievers.get(p.source), "enrich_paper", None)
+                if enricher is not None:
+                    enricher(p)
                 p.generate_tldr(self.openai_client, self.config.llm)
                 p.generate_affiliations(self.openai_client, self.config.llm)
         elif not self.config.executor.send_empty:

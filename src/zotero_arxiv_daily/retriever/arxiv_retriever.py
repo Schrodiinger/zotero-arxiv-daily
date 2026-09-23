@@ -108,36 +108,35 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
 
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
+    processing_delay = 0
+
     def __init__(self, config):
         super().__init__(config)
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=1, delay_seconds=3)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+        entries = [
+            entry for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
-            if all_paper_ids:
-                all_paper_ids = all_paper_ids[:5]
-                logger.info(f"Debug mode: using {len(all_paper_ids)} papers from RSS.")
+            if entries:
+                entries = entries[:5]
+                logger.info(f"Debug mode: using {len(entries)} papers from RSS.")
             else:
                 logger.warning(
                     "Debug mode enabled, but RSS returned no papers. "
                     "Falling back to the 5 most recent arXiv papers."
                 )
-        
+                client = arxiv.Client(num_retries=1, delay_seconds=3)
                 fallback_query = " OR ".join(
                     f"cat:{category}"
                     for category in self.config.source.arxiv.category
@@ -152,102 +151,89 @@ class ArxivRetriever(BaseRetriever):
         
                 try:
                     fallback_results = list(client.results(fallback_search))
-                    all_paper_ids = [
-                        result.get_short_id().split("v")[0]
-                        for result in fallback_results
-                    ]
                     logger.info(
-                        f"Debug fallback retrieved {len(all_paper_ids)} recent arXiv papers."
+                        f"Debug fallback retrieved {len(fallback_results)} recent arXiv papers."
                     )
+                    return fallback_results
                 except Exception as exc:
                     logger.error(f"Debug fallback failed: {exc}")
-                    all_paper_ids = []
+                    return []
 
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        api_unavailable = False
-
-        def retrieve_batch(paper_ids: list[str]) -> None:
-            """Fetch a batch and stop promptly if arXiv keeps rejecting requests."""
-            nonlocal api_unavailable
-            if not paper_ids or api_unavailable:
-                return
-            search = arxiv.Search(id_list=paper_ids)
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    return
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(
-                            f"arXiv API 429 on batch of {len(paper_ids)} papers, "
-                            f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
-                        )
-                        sleep(wait)
-                    elif exc.status == 406 and len(paper_ids) > 1:
-                        logger.warning(
-                            f"arXiv API returned 406 for a batch of {len(paper_ids)} papers; "
-                            "checking whether single-ID requests are accepted"
-                        )
-                        try:
-                            probe = list(client.results(arxiv.Search(id_list=paper_ids[:1])))
-                        except arxiv.HTTPError as probe_exc:
-                            if probe_exc.status == 406:
-                                api_unavailable = True
-                                logger.error(
-                                    "arXiv API also returned 406 for a single paper; "
-                                    "stopping retrieval to avoid hundreds of slow retries"
-                                )
-                                return
-                            raise
-                        raw_papers.extend(probe)
-                        bar.update(1)
-                        retrieve_batch(paper_ids[1:])
-                        return
-                    elif exc.status == 406:
-                        api_unavailable = True
-                        logger.error(
-                            f"arXiv API returned 406 for paper {paper_ids[0]}; "
-                            "stopping retrieval instead of retrying every remaining paper"
-                        )
-                        return
-                    else:
-                        raise
-
-        for i in range(0, len(all_paper_ids), 20):
-            retrieve_batch(all_paper_ids[i:i + 20])
-            if api_unavailable:
-                break
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
-
+        raw_papers = [self._result_from_rss_entry(entry) for entry in entries]
+        logger.info(f"Using arXiv RSS metadata for {len(raw_papers)} candidate papers.")
         return raw_papers
 
+    @staticmethod
+    def _result_from_rss_entry(entry) -> ArxivResult:
+        paper_id = entry.id.removeprefix("oai:arXiv.org:")
+        versionless_id = paper_id.rsplit("v", 1)[0] if paper_id.rsplit("v", 1)[-1].isdigit() else paper_id
+        entry_id = entry.get("link") or f"https://arxiv.org/abs/{versionless_id}"
+        summary = entry.get("summary", "")
+        if "Abstract:" in summary:
+            summary = summary.split("Abstract:", 1)[1].strip()
+
+        authors = [
+            ArxivResult.Author(name.strip())
+            for author in entry.get("authors", [])
+            for name in author.get("name", "").split(",")
+            if name.strip()
+        ]
+        if not authors and entry.get("dc_creator"):
+            creator = entry.get("dc_creator")
+            author_names = creator if isinstance(creator, list) else [creator]
+            authors = [
+                ArxivResult.Author(name.strip())
+                for value in author_names
+                for name in value.split(",")
+                if name.strip()
+            ]
+        links = [
+            ArxivResult.Link(
+                href=link.get("href", ""),
+                title=link.get("title"),
+                rel=link.get("rel", ""),
+                content_type=link.get("type"),
+            )
+            for link in entry.get("links", [])
+            if link.get("href")
+        ]
+        if not any(link.title == "pdf" for link in links):
+            links.append(ArxivResult.Link(f"https://arxiv.org/pdf/{versionless_id}", title="pdf"))
+        categories = [tag.get("term", "") for tag in entry.get("tags", []) if tag.get("term")]
+        primary = entry.get("arxiv_primary_category", {}).get("term", "")
+        return ArxivResult(
+            entry_id=entry_id,
+            title=entry.get("title", ""),
+            authors=authors,
+            summary=summary,
+            primary_category=primary or (categories[0] if categories else ""),
+            categories=categories,
+            links=links,
+        )
+
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
-        title = raw_paper.title
-        authors = [a.name for a in raw_paper.authors]
-        abstract = raw_paper.summary
-        pdf_url = raw_paper.pdf_url
+        return Paper(
+            source=self.name,
+            title=raw_paper.title,
+            authors=[a.name for a in raw_paper.authors],
+            abstract=raw_paper.summary,
+            url=raw_paper.entry_id,
+            pdf_url=raw_paper.pdf_url,
+        )
+
+    def enrich_paper(self, paper: Paper) -> None:
+        """Extract full text only after this paper survives reranking."""
+        raw_paper = ArxivResult(
+            entry_id=paper.url,
+            title=paper.title,
+            links=[ArxivResult.Link(paper.pdf_url, title="pdf")] if paper.pdf_url else [],
+        )
         full_text = extract_text_from_tar(raw_paper)
         if full_text is None:
             full_text = extract_text_from_html(raw_paper)
         if full_text is None:
             full_text = extract_text_from_pdf(raw_paper)
-        return Paper(
-            source=self.name,
-            title=title,
-            authors=authors,
-            abstract=abstract,
-            url=raw_paper.entry_id,
-            pdf_url=pdf_url,
-            full_text=full_text,
-        )
+        paper.full_text = full_text
 
 
 def extract_text_from_html(paper: ArxivResult) -> str | None:
