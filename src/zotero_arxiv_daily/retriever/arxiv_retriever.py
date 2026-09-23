@@ -167,21 +167,48 @@ class ArxivRetriever(BaseRetriever):
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 5
         batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
+
+        def retrieve_batch(paper_ids: list[str]) -> None:
+            """Fetch a batch, splitting it when arXiv rejects the request."""
+            if not paper_ids:
+                return
+            search = arxiv.Search(id_list=paper_ids)
             for attempt in range(max_batch_retries):
                 try:
                     batch = list(client.results(search))
                     bar.update(len(batch))
                     raw_papers.extend(batch)
-                    break
+                    return
                 except arxiv.HTTPError as exc:
                     if exc.status == 429 and attempt < max_batch_retries - 1:
                         wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
+                        logger.warning(
+                            f"arXiv API 429 on batch of {len(paper_ids)} papers, "
+                            f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
+                        )
                         sleep(wait)
+                    elif exc.status == 406 and len(paper_ids) > 1:
+                        # A single problematic ID or an API URL rejection should not
+                        # discard every paper in the batch. Narrow the request until
+                        # the rejected ID can be identified.
+                        midpoint = len(paper_ids) // 2
+                        logger.warning(
+                            f"arXiv API returned 406 for a batch of {len(paper_ids)} papers; "
+                            "splitting the batch"
+                        )
+                        retrieve_batch(paper_ids[:midpoint])
+                        sleep(3)
+                        retrieve_batch(paper_ids[midpoint:])
+                        return
+                    elif exc.status == 406:
+                        logger.warning(f"arXiv API returned 406 for paper {paper_ids[0]}; skipping it")
+                        bar.update(1)
+                        return
                     else:
                         raise
+
+        for i in range(0, len(all_paper_ids), 20):
+            retrieve_batch(all_paper_ids[i:i + 20])
             if i + 20 < len(all_paper_ids):
                 sleep(3)
         bar.close()
