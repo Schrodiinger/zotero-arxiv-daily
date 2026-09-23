@@ -114,7 +114,7 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        client = arxiv.Client(num_retries=1, delay_seconds=3)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -167,10 +167,12 @@ class ArxivRetriever(BaseRetriever):
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 5
         batch_retry_delay = 30
+        api_unavailable = False
 
         def retrieve_batch(paper_ids: list[str]) -> None:
-            """Fetch a batch, splitting it when arXiv rejects the request."""
-            if not paper_ids:
+            """Fetch a batch and stop promptly if arXiv keeps rejecting requests."""
+            nonlocal api_unavailable
+            if not paper_ids or api_unavailable:
                 return
             search = arxiv.Search(id_list=paper_ids)
             for attempt in range(max_batch_retries):
@@ -188,27 +190,39 @@ class ArxivRetriever(BaseRetriever):
                         )
                         sleep(wait)
                     elif exc.status == 406 and len(paper_ids) > 1:
-                        # A single problematic ID or an API URL rejection should not
-                        # discard every paper in the batch. Narrow the request until
-                        # the rejected ID can be identified.
-                        midpoint = len(paper_ids) // 2
                         logger.warning(
                             f"arXiv API returned 406 for a batch of {len(paper_ids)} papers; "
-                            "splitting the batch"
+                            "checking whether single-ID requests are accepted"
                         )
-                        retrieve_batch(paper_ids[:midpoint])
-                        sleep(3)
-                        retrieve_batch(paper_ids[midpoint:])
+                        try:
+                            probe = list(client.results(arxiv.Search(id_list=paper_ids[:1])))
+                        except arxiv.HTTPError as probe_exc:
+                            if probe_exc.status == 406:
+                                api_unavailable = True
+                                logger.error(
+                                    "arXiv API also returned 406 for a single paper; "
+                                    "stopping retrieval to avoid hundreds of slow retries"
+                                )
+                                return
+                            raise
+                        raw_papers.extend(probe)
+                        bar.update(1)
+                        retrieve_batch(paper_ids[1:])
                         return
                     elif exc.status == 406:
-                        logger.warning(f"arXiv API returned 406 for paper {paper_ids[0]}; skipping it")
-                        bar.update(1)
+                        api_unavailable = True
+                        logger.error(
+                            f"arXiv API returned 406 for paper {paper_ids[0]}; "
+                            "stopping retrieval instead of retrying every remaining paper"
+                        )
                         return
                     else:
                         raise
 
         for i in range(0, len(all_paper_ids), 20):
             retrieve_batch(all_paper_ids[i:i + 20])
+            if api_unavailable:
+                break
             if i + 20 < len(all_paper_ids):
                 sleep(3)
         bar.close()
