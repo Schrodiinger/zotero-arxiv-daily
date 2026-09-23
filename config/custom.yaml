@@ -23,8 +23,8 @@ llm:
 
 source:
   arxiv:
-    category: ["cs.AI", "cs.LG", "cs.CL", "cs.CV", "cs.AR", "cs.ET", "eess.SY"]
-    include_cross_list: false
+    category: ["cs.AI", "cs.LG", "cs.CL", "cs.MA", "cs.AR", "cs.ET", "cs.LO", "cs.PL", "cs.SE", "cs.CV", "cs.CE", "eess.SY", "eess.SP", "math.NA"]
+    include_cross_list: true
 
 executor:
   debug: ${oc.env:DEBUG,null}
